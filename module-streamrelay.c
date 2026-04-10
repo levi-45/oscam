@@ -15,6 +15,12 @@
 #include "oscam-string.h"
 #include "oscam-time.h"
 
+#ifdef WITH_EMU
+#include "cscrypt/des.h"
+#include "module-emulator-osemu.h"
+#include "module-emulator-powervu.h"
+#endif
+
 #define STREAM_UNDEFINED 0x00
 #define STREAM_VIDEO     0x01
 #define STREAM_AUDIO     0x02
@@ -42,12 +48,28 @@ static pthread_mutex_t stream_server_mutex;
 static int32_t glistenfd, mod_idx, gconncount = 0, gconnfd[STREAM_SERVER_MAX_CONNECTIONS], stream_resptime[STREAM_SERVER_MAX_CONNECTIONS];
 static char ecm_src[STREAM_SERVER_MAX_CONNECTIONS][9];
 static IN_ADDR_T client_ip[STREAM_SERVER_MAX_CONNECTIONS], stream_host_ip[STREAM_SERVER_MAX_CONNECTIONS];
+#ifdef WITH_EMU
+#define STATIC /* none */
+#else
+#define STATIC static
+#endif
 static in_port_t client_port[STREAM_SERVER_MAX_CONNECTIONS];
 struct s_client *streamrelay_client[STREAM_SERVER_MAX_CONNECTIONS];
 
-static pthread_mutex_t fixed_key_srvid_mutex;
-static uint16_t stream_cur_srvid[STREAM_SERVER_MAX_CONNECTIONS];
-static stream_client_key_data key_data[STREAM_SERVER_MAX_CONNECTIONS];
+STATIC pthread_mutex_t fixed_key_srvid_mutex;
+STATIC uint16_t stream_cur_srvid[STREAM_SERVER_MAX_CONNECTIONS];
+STATIC stream_client_key_data key_data[STREAM_SERVER_MAX_CONNECTIONS];
+
+#ifdef WITH_EMU
+int8_t stream_server_thread_init = 0;
+int8_t emu_stream_emm_enabled = 0;
+uint8_t emu_stream_server_mutex_init = 0;
+int8_t stream_server_has_ecm[EMU_STREAM_SERVER_MAX_CONNECTIONS];
+pthread_mutex_t emu_fixed_key_data_mutex[EMU_STREAM_SERVER_MAX_CONNECTIONS];
+emu_stream_client_key_data emu_fixed_key_data[EMU_STREAM_SERVER_MAX_CONNECTIONS];
+LLIST *ll_emu_stream_delayed_keys[EMU_STREAM_SERVER_MAX_CONNECTIONS];
+#endif
+
 #if DVBCSA_KEY_ECM
 static uint16_t last_srvid[STREAM_SERVER_MAX_CONNECTIONS];
 #endif
@@ -142,19 +164,48 @@ static void radegast_client_ecm(stream_client_data *cdata)
 			{ send_to_radegast(outgoing_data, packet_len); }
 	}
 }
+#endif // MODULE_RADEGAST
 
+#ifdef WITH_EMU
 void ParseEcmData(stream_client_data *cdata)
 {
 	uint8_t *data = cdata->ecm_data;
+	uint8_t dcw[16];
 	uint16_t section_length = SCT_LEN(data);
 
 	if (section_length < 11)
 		{ return; }
 
-	cs_strncpy(ecm_src[cdata->connid], "radegast", sizeof(ecm_src[cdata->connid]));
-	radegast_client_ecm(cdata);
+	if (caid_is_powervu(cdata->caid))
+	{
+		if (data[11] > cdata->ecm_nb || (cdata->ecm_nb == 255 && data[11] == 0) || ((cdata->ecm_nb - data[11]) > 5))
+		{
+			cdata->ecm_nb = data[11];
+			cdata->key.connid = cdata->connid;
+			powervu_ecm(data, dcw, NULL, cdata->srvid, cdata->caid, cdata->tsid, cdata->onid, cdata->ens, &cdata->key);
+		}
+	}
+#ifdef MODULE_RADEGAST
+	else
+	{
+		cs_strncpy(ecm_src[cdata->connid], "radegast", sizeof(ecm_src[cdata->connid]));
+		radegast_client_ecm(cdata);
+	}
+#endif
 }
-#endif // MODULE_RADEGAST
+#else
+#define ParseEcmData radegast_client_ecm
+#endif
+
+#if DVBCSA_KEY_ECM
+#define DVBCSA_HEADER_ECM 1
+#define dvbcsa_bs_key_set(a,b) dvbcsa_bs_key_set_ecm(ecm,a,b)
+#else
+#define DVBCSA_HEADER_ECM 0
+#endif
+#ifndef STATIC_LIBDVBCSA
+#define STATIC_LIBDVBCSA 0
+#endif
 
 static void write_cw(ECM_REQUEST *er, int32_t connid)
 {
@@ -166,13 +217,25 @@ static void write_cw(ECM_REQUEST *er, int32_t connid)
 	if (memcmp(er->cw, "\x00\x00\x00\x00\x00\x00\x00\x00", 8) != 0)
 	{
 		if (has_dvbcsa_ecm)
-			{ dvbcsa_bs_key_set(er->cw, key_data[connid].key[EVEN]); }
+		{
+#ifdef WITH_EMU
+			dvbcsa_bs_key_set(er->cw, key_data[connid].key[0][EVEN]);
+#else
+			dvbcsa_bs_key_set(er->cw, key_data[connid].key[EVEN]);
+#endif
+		}
 	}
 
 	if (memcmp(er->cw + 8, "\x00\x00\x00\x00\x00\x00\x00\x00", 8) != 0)
 	{
 		if (has_dvbcsa_ecm)
-			{ dvbcsa_bs_key_set(er->cw + 8, key_data[connid].key[ODD]); }
+		{
+#ifdef WITH_EMU
+			dvbcsa_bs_key_set(er->cw + 8, key_data[connid].key[0][ODD]);
+#else
+			dvbcsa_bs_key_set(er->cw + 8, key_data[connid].key[ODD]);
+#endif
+		}
 	}
 #if DVBCSA_KEY_ECM
 	if (er->srvid != last_srvid[connid] && ecm != 0 && has_dvbcsa_ecm)
@@ -184,6 +247,11 @@ static void write_cw(ECM_REQUEST *er, int32_t connid)
 			dvbcsa_get_ecm_table_fn ? dvbcsa_get_ecm_table_fn() : 0);
 		last_srvid[connid] = er->srvid;
 	}
+#endif
+#ifdef WITH_EMU
+	SAFE_MUTEX_LOCK(&emu_fixed_key_data_mutex[connid]);
+	emu_fixed_key_data[connid].csa_used = 1;
+	SAFE_MUTEX_UNLOCK(&emu_fixed_key_data_mutex[connid]);
 #endif
 }
 
@@ -215,24 +283,20 @@ static void update_client_info(ECM_REQUEST *er, int32_t connid)
 bool stream_write_cw(ECM_REQUEST *er)
 {
 	int32_t i;
-	if (er->rc == E_FOUND)
+	bool cw_written = false;
+	//SAFE_MUTEX_LOCK(&fixed_key_srvid_mutex);
+	for (i = 0; i < STREAM_SERVER_MAX_CONNECTIONS; i++)
 	{
-		bool cw_written = false;
-		//SAFE_MUTEX_LOCK(&fixed_key_srvid_mutex);
-		for (i = 0; i < STREAM_SERVER_MAX_CONNECTIONS; i++)
+		if (stream_cur_srvid[i] == er->srvid)
 		{
-			if (stream_cur_srvid[i] == er->srvid)
-			{
-				write_cw(er, i);
-				update_client_info(er, i);
-				cw_written = true;
-				// don't return as there might be more connections for the same channel (e.g. recordings)
-			}
+			write_cw(er, i);
+			update_client_info(er, i);
+			cw_written = true;
+			// don't return as there might be more connections for the same channel (e.g. recordings)
 		}
-		//SAFE_MUTEX_UNLOCK(&fixed_key_srvid_mutex);
-		return cw_written;
 	}
-	return true;
+	//SAFE_MUTEX_UNLOCK(&fixed_key_srvid_mutex);
+	return cw_written;
 }
 
 static void SearchTsPackets(const uint8_t *buf, const uint32_t bufLength, uint16_t *packetSize, uint16_t *startOffset)
@@ -362,6 +426,9 @@ static void ParsePatData(stream_client_data *cdata)
 {
 	int32_t i;
 	uint16_t srvid;
+#ifdef __BISS__
+	cdata->STREAMpidcount = 0;
+#endif
 	for (i = 8; i + 7 < SCT_LEN(cdata->pat_data); i += 4)
 	{
 		srvid = b2i(2, cdata->pat_data + i);
@@ -377,6 +444,21 @@ static void ParsePatData(stream_client_data *cdata)
 		}
 	}
 }
+
+#ifdef WITH_EMU
+static int8_t stream_client_get_caid(stream_client_data *cdata)
+{
+	uint32_t tmp1 = (cdata->srvid << 16) | cdata->pmt_pid;
+	uint8_t tmp2[2];
+
+	if (emu_find_key('A', tmp1, 0, "FAKE", tmp2, 2, 0, 0, 0, NULL))
+	{
+		cdata->caid = b2i(2, tmp2);
+		return 1;
+	}
+	return 0;
+}
+#endif
 
 static void ParseDescriptors(const uint8_t *buffer, const uint16_t info_length, uint8_t *type)
 {
@@ -545,6 +627,9 @@ static void ParsePmtData(stream_client_data *cdata)
 			case 0xD1:
 			case 0xEA:
 			{
+#ifdef WITH_EMU
+				cdata->video_pid = elementary_pid;
+#endif
 				cs_log_dbg(D_READER, "Stream client %i found video pid: 0x%04X (%i)",
 							cdata->connid, elementary_pid, elementary_pid);
 				stream_parse_pmt_ca_descriptor(cdata->pmt_data, i, 5, es_info_length, cdata);
@@ -559,6 +644,15 @@ static void ParsePmtData(stream_client_data *cdata)
 			case 0x2E:
 			case 0x81:
 			{
+#ifdef WITH_EMU
+				if (cdata->audio_pid_count >= EMU_STREAM_MAX_AUDIO_SUB_TRACKS)
+				{
+					continue;
+				}
+
+				cdata->audio_pids[cdata->audio_pid_count] = elementary_pid;
+				cdata->audio_pid_count++;
+#endif
 				cs_log_dbg(D_READER, "Stream client %i found audio pid: 0x%04X (%i)",
 							cdata->connid, elementary_pid, elementary_pid);
 				break;
@@ -570,16 +664,88 @@ static void ParsePmtData(stream_client_data *cdata)
 				uint8_t type = STREAM_UNDEFINED;
 				ParseDescriptors(cdata->pmt_data + i + 5, es_info_length, &type);
 				if (type == STREAM_AUDIO)
-					{ cs_log_dbg(D_READER, "Stream client %i found audio pid: 0x%04X (%i)",
-								cdata->connid, elementary_pid, elementary_pid); }
+				{
+#ifdef WITH_EMU
+					if (cdata->audio_pid_count >= EMU_STREAM_MAX_AUDIO_SUB_TRACKS)
+					{
+						continue;
+					}
+
+					cdata->audio_pids[cdata->audio_pid_count] = elementary_pid;
+					cdata->audio_pid_count++;
+#endif
+					cs_log_dbg(D_READER, "Stream client %i found audio pid: 0x%04X (%i)",
+								cdata->connid, elementary_pid, elementary_pid);
+				}
 				else if (type == STREAM_TELETEXT)
-					{ cs_log_dbg(D_READER, "Stream client %i found teletext pid: 0x%04X (%i)",
-								cdata->connid, elementary_pid, elementary_pid); }
+				{
+#ifdef WITH_EMU
+					cdata->teletext_pid = elementary_pid;
+#endif
+					cs_log_dbg(D_READER, "Stream client %i found teletext pid: 0x%04X (%i)",
+								cdata->connid, elementary_pid, elementary_pid);
+				}
 				break;
 			}
 		}
+#ifdef __BISS__
+		cdata->STREAMpids[cdata->STREAMpidcount] = elementary_pid;
+		cdata->STREAMpidcount++;
+#endif
+	}
+#ifdef WITH_EMU
+	// If we haven't found a CAID for this service,
+	// search the keyDB for a fake one
+	if (cdata->caid == NO_CAID_VALUE && stream_client_get_caid(cdata) == 1)
+	{
+		cs_log_dbg(D_READER, "Stream client %i found fake caid: 0x%04X (%i)",
+					cdata->connid, cdata->caid, cdata->caid);
+	}
+#endif
+}
+
+#ifdef WITH_EMU
+static void ParseCatData(stream_client_data *cdata)
+{
+	uint8_t *data = cdata->cat_data;
+	uint32_t i;
+
+	for (i = 8; i < (b2i(2, data + 1) & 0xFFF) - 1; i += data[i + 1] + 2)
+	{
+		if (data[i] != 0x09)
+		{
+			continue;
+		}
+
+		uint16_t caid = b2i(2, data + i + 2);
+
+		if (caid_is_powervu(caid)) // add all supported caids here
+		{
+			if (cdata->caid == NO_CAID_VALUE)
+			{
+				cdata->caid = caid;
+			}
+			cdata->emm_pid = b2i(2, data + i + 4) & 0x1FFF;;
+			cs_log_dbg(D_READER, "Stream client %i found emm pid: 0x%04X (%i)",
+						cdata->connid, cdata->emm_pid, cdata->emm_pid);
+			break;
+		}
 	}
 }
+
+static void ParseEmmData(stream_client_data *cdata)
+{
+	uint32_t keysAdded = 0;
+
+	emu_process_emm(NULL, cdata->caid, cdata->emm_data, &keysAdded);
+
+	if (keysAdded)
+	{
+		//refresh_entitlements(rdr);
+		cs_log("Stream client %i found %i keys", cdata->connid, keysAdded);
+	}
+}
+#endif
 
 static void ParseTsPackets(stream_client_data *data, uint8_t *stream_buf, uint32_t bufLength, uint16_t packetSize)
 {
@@ -621,7 +787,11 @@ static void ParseTsPackets(stream_client_data *data, uint8_t *stream_buf, uint32
 	}
 }
 
-static void decrypt(struct dvbcsa_bs_batch_s *tsbbatch, uint16_t fill[2], const uint8_t oddeven, const int32_t connid)
+#ifdef WITH_EMU
+static void decrypt_csa(struct dvbcsa_bs_batch_s *tsbbatch, uint16_t fill[2], const uint8_t oddeven, const int32_t connid, uint8_t cw_type)
+#else
+static void decrypt_csa(struct dvbcsa_bs_batch_s *tsbbatch, uint16_t fill[2], const uint8_t oddeven, const int32_t connid)
+#endif
 {
 	if (fill[oddeven] > 0)
 	{
@@ -639,10 +809,531 @@ static void decrypt(struct dvbcsa_bs_batch_s *tsbbatch, uint16_t fill[2], const 
 
 		fill[oddeven] = 0;
 
+#ifdef WITH_EMU
+		dvbcsa_bs_decrypt(key_data[connid].key[cw_type][oddeven], tsbbatch, 184);
+#else
 		dvbcsa_bs_decrypt(key_data[connid].key[oddeven], tsbbatch, 184);
+#endif
 	}
 }
-#define decrypt(a) decrypt(tsbbatch, fill, a, data->connid)
+#ifndef WITH_EMU
+#define decrypt(a) decrypt_csa(tsbbatch, fill, a, data->connid)
+#else // multiple cw
+#define decrypt(a) decrypt_csa(tsbbatch, fill, a, data->connid, 0)
+#define decrypt_pvu(a, b) decrypt_csa(tsbbatch, fill, a, data->connid, b)
+#endif
+
+#ifdef WITH_EMU
+static void DescrambleTsPacketsPowervu(stream_client_data *data, uint8_t *stream_buf, uint32_t bufLength, uint16_t packetSize, struct dvbcsa_bs_batch_s *tsbbatch)
+{
+	uint32_t i, j, tsHeader, *deskey;
+	uint16_t pid, offset, fill[2] = {0,0};
+	uint8_t *pdata, payloadStart, oddeven = 0, cw_type = 0;
+	int8_t oddKeyUsed;
+
+	for (i = 0; i < bufLength; i += packetSize)
+	{
+		tsHeader = b2i(4, stream_buf + i);
+		pid = (tsHeader & 0x1FFF00) >> 8;
+		payloadStart = (tsHeader & 0x400000) >> 22;
+		offset = (tsHeader & 0x20) ? 4 + stream_buf[i + 4] + 1 : 4;
+
+		if (packetSize - offset < 1)
+		{
+			continue;
+		}
+
+		if (emu_stream_emm_enabled && pid == 0x0001 && data->have_cat_data != 1) // Search the CAT for EMM pids
+		{
+			// set to null pid
+			stream_buf[i + 1] |= 0x1F;
+			stream_buf[i + 2] = 0xFF;
+
+			ParseTsData(0x01, 0xFF, 8, &data->have_cat_data, data->cat_data, sizeof(data->cat_data),
+						&data->cat_data_pos, payloadStart, stream_buf + i + offset, packetSize - offset, ParseCatData, data);
+			continue;
+		}
+
+		if (emu_stream_emm_enabled && data->emm_pid && pid == data->emm_pid) // Process the EMM data
+		{
+			// set to null pid
+			stream_buf[i + 1] |= 0x1F;
+			stream_buf[i + 2] = 0xFF;
+
+			ParseTsData(0x80, 0xF0, 3, &data->have_emm_data, data->emm_data, sizeof(data->emm_data),
+						&data->emm_data_pos, payloadStart, stream_buf + i + offset, packetSize - offset, ParseEmmData, data);
+			continue;
+		}
+
+		if (data->ecm_pid && pid == data->ecm_pid) // Process the ECM data
+		{
+			stream_server_has_ecm[data->connid] = 1;
+			// set to null pid
+			stream_buf[i + 1] |= 0x1F;
+			stream_buf[i + 2] = 0xFF;
+			ParseTsData(0x80, 0xFE, 3, &data->have_ecm_data, data->ecm_data, sizeof(data->ecm_data),
+						&data->ecm_data_pos, payloadStart, stream_buf + i + offset, packetSize - offset, ParseEcmData, data);
+			continue;
+		}
+
+		if ((tsHeader & 0xC0) == 0)
+		{
+			continue;
+		}
+
+		if (data->key.csa_used)
+		{
+			stream_buf[i + 3] &= 0x3f; // consider it decrypted now
+			oddeven = (tsHeader & 0xC0) == 0xC0 ? ODD: EVEN;
+			decrypt_pvu(oddeven == ODD ? EVEN : ODD, cw_type);
+
+			if (pid == data->video_pid) // start with video pid, since it is most dominant
+			{
+				cw_type = PVU_CW_VID;
+				tsbbatch[fill[oddeven]].data = &stream_buf[i + offset];
+				tsbbatch[fill[oddeven]].len = packetSize - offset;
+				fill[oddeven]++;
+				if (fill[oddeven] > cluster_size - 1)
+				{
+					decrypt_pvu(oddeven, cw_type);
+				}
+			}
+			else
+			{
+				if (cw_type != PVU_CW_VID)
+				{
+					decrypt_pvu(oddeven, PVU_CW_VID);
+				}
+				for (j = 0; j < data->audio_pid_count; j++)
+				{
+					if (pid == data->audio_pids[j])
+					{
+						if (cw_type != PVU_CW_A1 + j)
+						{
+							decrypt_pvu(oddeven, PVU_CW_A1 + j);
+						}
+						cw_type = PVU_CW_A1 + j;
+						tsbbatch[fill[oddeven]].data = &stream_buf[i + offset];
+						tsbbatch[fill[oddeven]].len = packetSize - offset;
+						fill[oddeven]++;
+						if (fill[oddeven] > cluster_size - 1)
+						{
+							decrypt_pvu(oddeven, cw_type);
+						}
+					}
+				}
+			}
+		}
+		else
+		{
+			oddKeyUsed = (tsHeader & 0xC0) == 0xC0 ? 1 : 0;
+			deskey = NULL;
+
+			if (pid == data->video_pid)
+			{
+				deskey = data->key.pvu_des_ks[PVU_CW_VID][oddKeyUsed];
+			}
+			else
+			{
+				for (j = 0; j < data->audio_pid_count; j++)
+				{
+					if (pid == data->audio_pids[j])
+					{
+						deskey = data->key.pvu_des_ks[PVU_CW_A1 + j][oddKeyUsed];
+					}
+				}
+			}
+
+			if (deskey == NULL)
+			{
+				deskey = data->key.pvu_des_ks[PVU_CW_HSD][oddKeyUsed];
+			}
+
+			for (j = offset; j + 7 < 188; j += 8)
+			{
+				pdata = stream_buf + i + j;
+				des(pdata, deskey, 0);
+			}
+
+			stream_buf[i + 3] &= 0x3F;
+		}
+	}
+	if (data->key.csa_used) { decrypt_pvu(oddeven, cw_type); }
+}
+static void DescrambleTsPacketsRosscrypt1(emu_stream_client_data *data, uint8_t *stream_buf, uint32_t bufLength, uint16_t packetSize)
+{
+	int8_t is_av_pid;
+	int32_t j;
+
+	uint8_t scramblingControl;
+	uint16_t pid, offset;
+	uint32_t i, tsHeader;
+
+	for (i = 0; i < bufLength; i += packetSize)
+	{
+		tsHeader = b2i(4, stream_buf + i);
+		pid = (tsHeader & 0x1FFF00) >> 8;
+		scramblingControl = tsHeader & 0xC0;
+
+		if (tsHeader & 0x20)
+		{
+			offset = 4 + stream_buf[i + 4] + 1;
+		}
+		else
+		{
+			offset = 4;
+		}
+
+		if (packetSize - offset < 1)
+		{
+			continue;
+		}
+
+		if (scramblingControl == 0)
+		{
+			continue;
+		}
+
+		if (!(stream_buf[i + 3] & 0x10))
+		{
+			stream_buf[i + 3] &= 0x3F;
+			continue;
+		}
+
+		is_av_pid = 0;
+
+		if (pid == data->video_pid)
+		{
+			is_av_pid = 1;
+		}
+		else
+		{
+			for (j = 0; j < data->audio_pid_count; j++)
+			{
+				if (pid == data->audio_pids[j])
+				{
+					is_av_pid = 1;
+					break;
+				}
+			}
+		}
+
+		if (is_av_pid)
+		{
+			static uint8_t dyn_key[184];
+			static uint8_t last_packet[184];
+
+			// Reset key on channel change
+			if (data->reset_key_data == 1)
+			{
+				memset(dyn_key, 0x00, 184);
+				memset(last_packet, 0x00, 184);
+				data->reset_key_data = 0;
+			}
+
+			if (memcmp(last_packet, stream_buf + i + 4, 184) == 0)
+			{
+				if (memcmp(dyn_key, stream_buf + i + 4, 184) != 0)
+				{
+					memcpy(dyn_key, stream_buf + i + 4, 184);
+				}
+			}
+			else
+			{
+				memcpy(last_packet, stream_buf + i + 4, 184);
+			}
+
+			for (j = 0; j < 184; j++)
+			{
+				stream_buf[i + 4 + j] ^= dyn_key[j];
+			}
+
+			stream_buf[i + 3] &= 0x3F;
+		}
+	}
+}
+
+static void DescrambleTsPacketsCompel(emu_stream_client_data *data, uint8_t *stream_buf, uint32_t bufLength, uint16_t packetSize)
+{
+	int8_t is_pes_pid; // any PES pid
+	int32_t j;
+	const int8_t limit = 4;
+
+	uint8_t scramblingControl;
+	uint16_t pid, offset;
+	uint32_t i, tsHeader;
+
+	for (i = 0; i < bufLength; i += packetSize)
+	{
+		tsHeader = b2i(4, stream_buf + i);
+		pid = (tsHeader & 0x1FFF00) >> 8;
+		scramblingControl = tsHeader & 0xC0;
+
+		if (tsHeader & 0x20)
+		{
+			offset = 4 + stream_buf[i + 4] + 1;
+		}
+		else
+		{
+			offset = 4;
+		}
+
+		if (packetSize - offset < 1)
+		{
+			continue;
+		}
+
+		if (scramblingControl == 0)
+		{
+			continue;
+		}
+
+		if (!(stream_buf[i + 3] & 0x10))
+		{
+			stream_buf[i + 3] &= 0x3F;
+			continue;
+		}
+
+		is_pes_pid = 0;
+
+		if (pid == data->video_pid)
+		{
+			is_pes_pid = 1;
+		}
+		else if (pid == data->teletext_pid)
+		{
+			is_pes_pid = 1;
+		}
+		else
+		{
+			for (j = 0; j < data->audio_pid_count; j++)
+			{
+				if (pid == data->audio_pids[j])
+				{
+					is_pes_pid = 1;
+					break;
+				}
+			}
+		}
+
+		if (is_pes_pid)
+		{
+			static uint8_t dyn_key[184];
+			static uint8_t found_key_bytes[184];
+			static uint8_t found_key_bytes_count = 8;
+			static uint8_t lastScramblingControl = 0xFF;
+
+			int8_t matches00 = 0;
+			int8_t matchesFF = 0;
+			int8_t last00_was_good = 0;
+			int8_t lastFF_was_good = 0;
+
+			// Reset key when scrambling control changes from odd to even
+			// and vice versa (every ~53 seconds) or when we change channel
+			if (lastScramblingControl != scramblingControl)
+			{
+				memset(dyn_key, 0x00, 184);
+				memset(found_key_bytes, 0, 184);
+				found_key_bytes_count = 8;
+				lastScramblingControl = scramblingControl;
+
+				//cs_log_dbg(D_READER, "resetting key data (scrambling control: %02X)", scramblingControl);
+			}
+
+			for (j = 8; j < 184; j++)
+			{
+				if (found_key_bytes_count == 184)
+				{
+					break;
+				}
+
+				if (stream_buf[i + 4 + j] == 0x00)
+				{
+					last00_was_good = 1;
+					matches00++;
+
+					if (matches00 > limit && found_key_bytes[j] == 0)
+					{
+						dyn_key[j] = 0x00;
+						found_key_bytes[j] = 1;
+						found_key_bytes_count++;
+					}
+				}
+				else if (stream_buf[i + 4 + j] == 0x3F)
+				{
+					last00_was_good = 1;
+					matches00++;
+
+					if (matches00 > limit && found_key_bytes[j] == 0)
+					{
+						dyn_key[j] = 0x3F;
+						found_key_bytes[j] = 1;
+						found_key_bytes_count++;
+					}
+				}
+				else
+				{
+					if (last00_was_good == 1)
+					{
+						last00_was_good = 0;
+						matches00--;
+					}
+					else
+					{
+						matches00 -= 2;
+					}
+
+					if (matches00 < 0)
+					{
+						matches00 = 0;
+					}
+				}
+
+				if (stream_buf[i + 4 + j] == 0xC0)
+				{
+					lastFF_was_good = 1;
+					matchesFF++;
+
+					if (matchesFF > limit && found_key_bytes[j] == 0)
+					{
+						dyn_key[j] = 0x3F;
+						found_key_bytes[j] = 1;
+						found_key_bytes_count++;
+					}
+				}
+				else if (stream_buf[i + 4 + j] == 0xFF)
+				{
+					lastFF_was_good = 1;
+					matchesFF++;
+
+					if (matchesFF > limit && found_key_bytes[j] == 0)
+					{
+						dyn_key[j] = 0x00;
+						found_key_bytes[j] = 1;
+						found_key_bytes_count++;
+					}
+				}
+				else
+				{
+					if (lastFF_was_good == 1)
+					{
+						lastFF_was_good = 0;
+						matchesFF--;
+					}
+					else
+					{
+						matchesFF -= 2;
+					}
+
+					if (matchesFF < 0)
+					{
+						matchesFF = 0;
+					}
+				}
+			}
+
+			for (j = 183; j >= 8; j--)
+			{
+				if (found_key_bytes_count == 184)
+				{
+					break;
+				}
+
+				if (stream_buf[i + 4 + j] == 0x00)
+				{
+					last00_was_good = 1;
+					matches00++;
+
+					if (matches00 > limit && found_key_bytes[j] == 0)
+					{
+						dyn_key[j] = 0x00;
+						found_key_bytes[j] = 1;
+						found_key_bytes_count++;
+					}
+				}
+				else if (stream_buf[i + 4 + j] == 0x3F)
+				{
+					last00_was_good = 1;
+					matches00++;
+
+					if (matches00 > limit && found_key_bytes[j] == 0)
+					{
+						dyn_key[j] = 0x3F;
+						found_key_bytes[j] = 1;
+						found_key_bytes_count++;
+					}
+				}
+				else
+				{
+					if (last00_was_good == 1)
+					{
+						last00_was_good = 0;
+						matches00--;
+					}
+					else
+					{
+						matches00 -= 2;
+					}
+
+					if (matches00 < 0)
+					{
+						matches00 = 0;
+					}
+				}
+
+				if (stream_buf[i + 4 + j] == 0xC0)
+				{
+					lastFF_was_good = 1;
+					matchesFF++;
+
+					if (matchesFF > limit && found_key_bytes[j] == 0)
+					{
+						dyn_key[j] = 0x3F;
+						found_key_bytes[j] = 1;
+						found_key_bytes_count++;
+					}
+				}
+				else if (stream_buf[i + 4 + j] == 0xFF)
+				{
+					lastFF_was_good = 1;
+					matchesFF++;
+
+					if (matchesFF > limit && found_key_bytes[j] == 0)
+					{
+						dyn_key[j] = 0x00;
+						found_key_bytes[j] = 1;
+						found_key_bytes_count++;
+					}
+				}
+				else
+				{
+					if (lastFF_was_good == 1)
+					{
+						lastFF_was_good = 0;
+						matchesFF--;
+					}
+					else
+					{
+						matchesFF -= 2;
+					}
+
+					if (matchesFF < 0)
+					{
+						matchesFF = 0;
+					}
+				}
+			}
+
+			for (j = 8; j < 184; j++)
+			{
+				stream_buf[i + 4 + j] ^= dyn_key[j];
+			}
+		}
+
+		stream_buf[i + 3] &= 0x3F; // Clear scrambling bits
+	}
+}
+#endif // WITH_EMU
 
 static void DescrambleTsPackets(stream_client_data *data, uint8_t *stream_buf, uint32_t bufLength, uint16_t packetSize, struct dvbcsa_bs_batch_s *tsbbatch)
 {
@@ -665,6 +1356,31 @@ static void DescrambleTsPackets(stream_client_data *data, uint8_t *stream_buf, u
 		if (packetSize - offset < 1)
 			{ continue; }
 #ifdef MODULE_RADEGAST
+#ifdef __BISS__
+		if(data->ecm_pid == 0x1FFF && caid_is_biss_fixed(data->caid))
+		{
+			uint32_t j, n;
+			uint16_t ecm_len = 7;
+			data->ecm_data[0] = 0x80; // to pass the cache check it must be 0x80 or 0x81
+			data->ecm_data[1] = 0x00;
+			data->ecm_data[2] = 0x04;
+			i2b_buf(2, data->srvid, data->ecm_data + 3);
+			i2b_buf(2, data->pmt_pid, data->ecm_data + 5);
+			for(j = 0, n = 7; j < data->STREAMpidcount; j++, n += 2)
+			{
+				i2b_buf(2, data->STREAMpids[j], data->ecm_data + n);
+				data->ecm_data[2] += 2;
+				ecm_len += 2;
+			}
+			data->ens &= 0x0FFFFFFF; // clear top 4 bits (in case of DVB-T/C or garbage), prepare for flagging
+			data->ens |= 0xA0000000; // flag to emu: this is the namespace, not a pid
+			i2b_buf(2, data->tsid, data->ecm_data + ecm_len);     // place tsid after the last stream pid
+			i2b_buf(2, data->onid, data->ecm_data + ecm_len + 2); // place onid right after tsid
+			i2b_buf(4, data->ens, data->ecm_data + ecm_len + 4);  // place namespace at the end of the ecm
+			data->ecm_data[2] += 8;
+			ParseEcmData(data);
+		} else
+#endif // __BISS__
 		if (data->ecm_pid && pid == data->ecm_pid) // Process the ECM data
 		{
 			// set to null pid
@@ -775,6 +1491,9 @@ static void stream_client_disconnect(stream_client_conn_data *conndata)
 #if DVBCSA_KEY_ECM
 	last_srvid[conndata->connid] = NO_SRVID_VALUE;
 #endif
+#ifdef WITH_EMU
+	stream_server_has_ecm[conndata->connid] = 0;
+#endif
 	SAFE_MUTEX_UNLOCK(&fixed_key_srvid_mutex);
 
 	SAFE_MUTEX_LOCK(&stream_server_mutex);
@@ -870,10 +1589,12 @@ static void *stream_client_handler(void *arg)
 	uint8_t descrambling = 0;
 
 	struct timeb start, end;
-
+#ifdef WITH_EMU
+	int32_t cur_dvb_buffer_size, cur_dvb_buffer_wait;
+#else
 	const int32_t cur_dvb_buffer_size = DVB_BUFFER_SIZE_CSA;
 	const int32_t cur_dvb_buffer_wait = DVB_BUFFER_WAIT_CSA;
-
+#endif
 	struct dvbcsa_bs_batch_s *tsbbatch = NULL;
 
 	create_streamrelay_client(conndata);
@@ -947,14 +1668,25 @@ static void *stream_client_handler(void *arg)
 		if (data->srvid == 0) // We didn't get a srvid - Exit
 			{ break; }
 
+#ifndef WITH_EMU
 		key_data[conndata->connid].key[ODD]  = dvbcsa_bs_key_alloc();
 		key_data[conndata->connid].key[EVEN] = dvbcsa_bs_key_alloc();
+#else
+		for (i = 0; i < EMU_STREAM_MAX_AUDIO_SUB_TRACKS + 2; i++)
+		{
+			key_data[conndata->connid].key[i][ODD]  = dvbcsa_bs_key_alloc();
+			key_data[conndata->connid].key[i][EVEN] = dvbcsa_bs_key_alloc();
+		}
+#endif
 
 		if (!cs_malloc(&tsbbatch, (cluster_size + 1) * sizeof(struct dvbcsa_bs_batch_s)))
 			{ break; }
 
 		SAFE_MUTEX_LOCK(&fixed_key_srvid_mutex);
 		stream_cur_srvid[conndata->connid] = data->srvid;
+#ifdef WITH_EMU
+		stream_server_has_ecm[conndata->connid] = 0;
+#endif
 		SAFE_MUTEX_UNLOCK(&fixed_key_srvid_mutex);
 
 		cs_log("Stream client %i request. host=%s port=%d path=%s (%s)", conndata->connid, conndata->stream_host, cfg.stream_source_port, stream_path, !cfg.stream_client_source_host ? "config" : strchr(http_host,':') ? "http header" : "client ip");
@@ -978,6 +1710,9 @@ static void *stream_client_handler(void *arg)
 		data->have_cat_data = 0;
 		data->have_ecm_data = 0;
 		data->have_emm_data = 0;
+#ifdef WITH_EMU
+		data->reset_key_data = 1;
+#endif
 
 		while (!exit_oscam && clientStatus != -1 && streamConnectErrorCount < 3
 				&& streamDataErrorCount < 15)
@@ -1002,6 +1737,18 @@ static void *stream_client_handler(void *arg)
 					&& (streamConnectErrorCount < 3 || streamDataErrorCount < 15))
 #endif
 			{
+#ifdef WITH_EMU
+				if (data->key.csa_used)
+				{
+					cur_dvb_buffer_size = EMU_DVB_BUFFER_SIZE_CSA;
+					cur_dvb_buffer_wait = EMU_DVB_BUFFER_WAIT_CSA;
+				}
+				else
+				{
+					cur_dvb_buffer_size = EMU_DVB_BUFFER_SIZE_DES;
+					cur_dvb_buffer_wait = EMU_DVB_BUFFER_WAIT_DES;
+				}
+#endif
 				if (!streamrelay_client[conndata->connid] || streamrelay_client[conndata->connid]->kill)
 				{
 					clientStatus = -1;
@@ -1108,9 +1855,26 @@ static void *stream_client_handler(void *arg)
 								clientStatus = -1;
 								break;
 							}
-							if ((cfg.stream_relay_ctab.ctnum == 0 || chk_ctab_ex(data->caid, &cfg.stream_relay_ctab)) && data->caid != 0xA101 && data->caid != NO_CAID_VALUE)
+							if (cfg.stream_relay_ctab.ctnum == 0 || chk_ctab_ex(data->caid, &cfg.stream_relay_ctab))
 							{
-								DescrambleTsPackets(data, stream_buf + startOffset, packetCount * packetSize, packetSize, tsbbatch);
+#ifdef WITH_EMU
+								if (caid_is_powervu(data->caid))
+								{
+									DescrambleTsPacketsPowervu(data, stream_buf + startOffset, packetCount * packetSize, packetSize, tsbbatch);
+								}
+								else if (data->caid == 0xA101) // Rosscrypt1
+								{
+									DescrambleTsPacketsRosscrypt1(data, stream_buf + startOffset, packetCount * packetSize, packetSize);
+								}
+								else if (data->caid == NO_CAID_VALUE) // Compel
+								{
+									DescrambleTsPacketsCompel(data, stream_buf + startOffset, packetCount * packetSize, packetSize);
+								}
+								else
+#endif // WITH_EMU
+								{
+									DescrambleTsPackets(data, stream_buf + startOffset, packetCount * packetSize, packetSize, tsbbatch);
+								}
 								if (!descrambling)
 								{
 									if (cfg.stream_relay_buffer_time)
@@ -1148,12 +1912,20 @@ static void *stream_client_handler(void *arg)
 
 	NULLFREE(http_buf);
 	NULLFREE(stream_buf);
-
+#ifndef WITH_EMU
 	dvbcsa_bs_key_free(key_data[conndata->connid].key[ODD]);
 	dvbcsa_bs_key_free(key_data[conndata->connid].key[EVEN]);
 	key_data[conndata->connid].key[ODD] = NULL;
 	key_data[conndata->connid].key[EVEN] = NULL;
-
+#else
+	for (i = 0; i < EMU_STREAM_MAX_AUDIO_SUB_TRACKS + 2; i++)
+	{
+		dvbcsa_bs_key_free(key_data[conndata->connid].key[i][ODD]);
+		dvbcsa_bs_key_free(key_data[conndata->connid].key[i][EVEN]);
+		key_data[conndata->connid].key[i][ODD] = NULL;
+		key_data[conndata->connid].key[i][EVEN] = NULL;
+	}
+#endif
 	NULLFREE(tsbbatch);
 	NULLFREE(data);
 
@@ -1212,6 +1984,9 @@ static void *stream_server(void)
 		for (i = 0; i < STREAM_SERVER_MAX_CONNECTIONS; i++)
 		{
 			stream_cur_srvid[i] = NO_SRVID_VALUE;
+#ifdef WITH_EMU
+			stream_server_has_ecm[i] = 0;
+#endif
 		}
 		SAFE_MUTEX_UNLOCK(&fixed_key_srvid_mutex);
 
@@ -1330,11 +2105,87 @@ void *streamrelay_handler(struct s_client *UNUSED(cl), uint8_t *UNUSED(mbuf), in
 			snprintf(authtmp, sizeof(authtmp), "%s:%s", cfg.stream_source_auth_user, cfg.stream_source_auth_password);
 			b64encode(authtmp, cs_strlen(authtmp), &stream_source_auth);
 		}
+
+#ifdef WITH_EMU
+		emu_stream_emm_enabled = cfg.emu_stream_emm_enabled;
+#endif
+
 		mod_idx = module_idx;
 		start_thread("stream_server", stream_server, NULL, NULL, 1, 1);
 	}
 	return NULL;
 }
+
+#if WITH_EMU
+void *stream_key_delayer(void *UNUSED(arg))
+{
+	int32_t i, j;
+	const uint8_t ecm = 0;
+	emu_stream_client_key_data *cdata;
+	LL_ITER it;
+	emu_stream_cw_item *item;
+	struct timeb t_now;
+
+	while (!exit_oscam)
+	{
+		cs_ftime(&t_now);
+
+		for (i = 0; i < STREAM_SERVER_MAX_CONNECTIONS; i++)
+		{
+			it = ll_iter_create(ll_emu_stream_delayed_keys[i]);
+
+			while ((item = ll_iter_next(&it)))
+			{
+				if (comp_timeb(&t_now, &item->write_time) < 0)
+				{
+					break;
+				}
+
+				SAFE_MUTEX_LOCK(&emu_fixed_key_data_mutex[i]);
+
+				cdata = &emu_fixed_key_data[i];
+
+				for (j = 0; j < EMU_STREAM_MAX_AUDIO_SUB_TRACKS + 2; j++)
+				{
+					if (item->csa_used)
+					{
+						if (item->is_even)
+						{
+							dvbcsa_bs_key_set(item->cw[j], key_data[cdata->connid].key[j][EVEN]);
+						}
+						else
+						{
+							dvbcsa_bs_key_set(item->cw[j], key_data[cdata->connid].key[j][ODD]);
+						}
+
+						cdata->csa_used = 1;
+					}
+					else
+					{
+						if (item->is_even)
+						{
+							des_set_key(item->cw[j], cdata->pvu_des_ks[j][0]);
+						}
+						else
+						{
+							des_set_key(item->cw[j], cdata->pvu_des_ks[j][1]);
+						}
+
+						cdata->csa_used = 0;
+					}
+				}
+				SAFE_MUTEX_UNLOCK(&emu_fixed_key_data_mutex[i]);
+
+				ll_iter_remove_data(&it);
+			}
+		}
+
+		cs_sleepms(25);
+	}
+
+	return NULL;
+}
+#endif
 
 void stop_stream_server(void)
 {

@@ -44,6 +44,10 @@
 #include "reader-common.h"
 #include "module-gbox.h"
 
+#ifdef WITH_EMU
+	void add_emu_reader(void);
+#endif
+
 #ifdef WITH_SSL
 #include <openssl/crypto.h>
 #include <openssl/ssl.h>
@@ -457,6 +461,8 @@ static void write_versionfile(bool use_stdout)
 #ifdef WITH_SIGNING
 	write_conf(WITH_SIGNING, "Binary signing support");
 #endif
+	write_conf(WITH_EMU, "Emulator support");
+	write_conf(WITH_SOFTCAM, "Built-in SoftCam.Key");
 
 	fprintf(fp, "\n");
 	write_conf(MODULE_CAMD33, "camd 3.3x");
@@ -1682,6 +1688,9 @@ const struct s_cardreader *cardreaders[] =
 #ifdef CARDREADER_STINGER
 	&cardreader_stinger,
 #endif
+#ifdef WITH_EMU
+	&cardreader_emu,
+#endif
 
 	NULL
 };
@@ -1861,6 +1870,9 @@ int32_t main(int32_t argc, char *argv[])
 
 	init_sidtab();
 	init_readerdb();
+#ifdef WITH_EMU
+	add_emu_reader();
+#endif
 	cfg.account = init_userdb();
 	init_signal();
 	init_provid();

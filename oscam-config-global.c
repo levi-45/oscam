@@ -940,6 +940,10 @@ static const struct config_list streamrelay_opts[] =
 	DEF_OPT_STR("stream_source_auth_password"    , OFS(stream_source_auth_password),  NULL),
 	DEF_OPT_UINT32("stream_relay_buffer_time"    , OFS(stream_relay_buffer_time),     0),
 	DEF_OPT_UINT8("stream_relay_reconnect_count" , OFS(stream_relay_reconnect_count), 0),
+#ifdef WITH_EMU
+	DEF_OPT_INT8("stream_emm_enabled"            , OFS(emu_stream_emm_enabled),       0),
+	DEF_OPT_UINT32("stream_ecm_delay"            , OFS(emu_stream_ecm_delay),         600),
+#endif
 	DEF_OPT_INT8("stream_display_client"         , OFS(stream_display_client),        0),
 	DEF_OPT_INT8("stream_reuse_client"           , OFS(stream_reuse_client),          0),
 #ifdef WEBIF

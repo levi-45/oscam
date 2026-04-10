@@ -6,6 +6,9 @@
 #define DES_RIGHT 4
 #define DES_HASH  8
 
+#define DES_ECM_CRYPT    0
+#define DES_ECM_HASH     DES_HASH
+
 void nc_des(uint8_t key[], uint8_t mode, uint8_t data[]);
 int nc_des_encrypt(uint8_t *buffer, int len, uint8_t *deskey);
 int nc_des_decrypt(uint8_t *buffer, int len, uint8_t *deskey);
